@@ -2,78 +2,115 @@ import cv2
 import numpy as np
 import math
 
-# --- 카메라 설정 ---
+# --- 카메라 및 하드웨어 설정 ---
 ROBOT_HEIGHT, TILT_ANGLE, FOCAL_LENGTH = 25.0, 20.0, 650.0
 OFFSET_X, OFFSET_Y = 0.0, 0.0
 
 cap = cv2.VideoCapture(0)
-# 프레임 설정 (환경에 따라 640x480 또는 320x240 추천)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+def select_best_ball(ball_candidates, img_w, img_h):
+    """
+    탐지된 공 리스트 중 점수가 가장 높은 공을 선택
+    ball_candidates: [(cX, cY, radius, final_x, final_y, steering, contour), ...]
+    """
+    if not ball_candidates:
+        return None
+
+    best_ball = None
+    max_score = -999999
+
+    for ball in ball_candidates:
+        cX, cY, radius, f_x, f_y, steer, cnt = ball
+        
+        # 1. 거리 점수: 가까울수록(f_y가 작을수록) 점수 높음
+        distance_score = (500 - f_y) * 2.0 
+        
+        # 2. 각도 패널티: 정면(steer=0)에서 멀어질수록 감점
+        angle_penalty = abs(steer) * 5.0
+        
+        # 3. 크기 점수: 공이 화면에서 크게 보이면 데이터가 정확함
+        size_score = radius * 1.5
+
+        total_score = distance_score - angle_penalty + size_score
+
+        if total_score > max_score:
+            max_score = total_score
+            best_ball = ball
+
+    return best_ball
 
 def detect_ball(frame):
     img_h, img_w = frame.shape[:2]
     center_x, center_y = img_w / 2, img_h / 2
 
-    # [수정] 화면을 자르지 않고, 전체 프레임에 가벼운 블러만 적용
-    # CLAHE 대신 GaussianBlur로 고속 노이즈 제거
+    # 전처리
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     
-    # 주황색 공 탐지 범위 (채도와 명도 하한선을 낮춰 탐지력 강화)
-    lower_ball = np.array([5, 100, 100])
-    upper_ball = np.array([25, 255, 255])
-    mask = cv2.inRange(hsv, lower_ball, upper_ball)
-    
-    # 모폴로지 연산 (작은 노이즈 제거 및 구멍 메꾸기)
+    mask = cv2.inRange(hsv, np.array([5, 100, 100]), np.array([25, 255, 255]))
     mask = cv2.erode(mask, None, iterations=1)
     mask = cv2.dilate(mask, None, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
+    ball_candidates = []
+
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area > 150: # 너무 작은 노이즈 무시
+        if area > 150:
             (x, y), radius = cv2.minEnclosingCircle(contour)
             if radius > 10:
                 cX, cY = int(x), int(y)
                 bottom_y = cY + int(radius)
                 
-                # --- 물리 거리 계산 (삼각측량) ---
+                # 물리 거리 계산
                 dy = bottom_y - center_y
                 angle_pixel_rad = math.atan2(dy, FOCAL_LENGTH)
                 total_pitch_rad = math.radians(TILT_ANGLE) + angle_pixel_rad
                 
-                # 거리 계산 (분모 0 방지)
                 if total_pitch_rad > 0.05:
                     cam_dist_y = ROBOT_HEIGHT / math.tan(total_pitch_rad)
                     dx = cX - center_x
                     angle_yaw_rad = math.atan2(dx, FOCAL_LENGTH)
                     cam_dist_x = cam_dist_y * math.tan(angle_yaw_rad)
                     
-                    final_x = cam_dist_x + OFFSET_X
-                    final_y = cam_dist_y - OFFSET_Y
-                    steering_angle = math.degrees(math.atan2(final_x, final_y))
-
-                    # --- 원본 프레임에 GUI 그리기 ---
-                    cv2.circle(frame, (cX, cY), int(radius), (0, 255, 0), 2)
-                    cv2.line(frame, (int(center_x), img_h), (cX, bottom_y), (255, 0, 0), 1)
+                    f_x = cam_dist_x + OFFSET_X
+                    f_y = cam_dist_y - OFFSET_Y
+                    steer = math.degrees(math.atan2(f_x, f_y))
                     
-                    text_pos = f"X:{final_x:.1f} Y:{final_y:.1f}cm"
-                    text_angle = f"STEER:{steering_angle:.1f}deg"
-                    cv2.putText(frame, text_pos, (cX - 50, cY - int(radius) - 20), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                    cv2.putText(frame, text_angle, (cX - 50, cY - int(radius) - 5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    # 후보군 리스트에 저장
+                    ball_candidates.append((cX, cY, radius, f_x, f_y, steer, contour))
+
+    # --- 우선순위 선택 알고리즘 적용 ---
+    target_ball = select_best_ball(ball_candidates, img_w, img_h)
+
+    # GUI 그리기
+    for ball in ball_candidates:
+        cX, cY, radius, f_x, f_y, steer, cnt = ball
+        
+        if target_ball and ball == target_ball:
+            # 타겟 공: 파란색 원 + 상세 정보
+            cv2.circle(frame, (cX, cY), int(radius), (255, 0, 0), 3)
+            cv2.line(frame, (int(center_x), img_h), (cX, int(cY + radius)), (255, 0, 0), 2)
+            
+            text_pos = f"TARGET X:{f_x:.1f} Y:{f_y:.1f}cm"
+            text_angle = f"STEER:{steer:.1f}deg"
+            cv2.putText(frame, text_pos, (cX - 60, cY - int(radius) - 25), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(frame, text_angle, (cX - 60, cY - int(radius) - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        else:
+            # 일반 후보: 초록색 얇은 원
+            cv2.circle(frame, (cX, cY), int(radius), (0, 255, 0), 1)
 
 while True:
     ret, frame = cap.read()
     if not ret: break
 
     detect_ball(frame)
-    
-    # [수정] 잘리지 않은 전체 화면을 보여줌
-    cv2.imshow('Full Robot View', frame)
+    cv2.imshow('Priority Robot View', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
